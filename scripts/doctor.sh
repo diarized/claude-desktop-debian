@@ -462,6 +462,8 @@ _doctor_check_filename_limit() {
 	local name_max
 	name_max=$(getconf NAME_MAX "$probe_dir" 2>/dev/null) || return 0
 	[[ $name_max =~ ^[0-9]+$ ]] || return 0
+	# Force base 10 so a leading zero can't trip octal arithmetic.
+	name_max=$((10#$name_max))
 
 	((name_max >= 200)) && return 0
 
@@ -562,10 +564,16 @@ _doctor_check_recent_crashes() {
 # sources this file) to surface what keyring Electron will use for
 # safeStorage / cookie encryption. 'basic' is valid but means tokens
 # rely on filesystem permissions alone, so we note it for visibility.
-# Never fails — basic is an intentional fallback, not an error.
+# An empty result means detection itself failed (e.g. a sourcing-order
+# regression) and warns rather than emitting a green PASS with a blank
+# value.
 _doctor_check_password_store() {
 	local store
 	store=$(_detect_password_store)
+	if [[ -z $store ]]; then
+		_warn 'Password store: unable to detect backend'
+		return
+	fi
 	_pass "Password store: $store"
 	if [[ $store == 'basic' ]]; then
 		_info \
@@ -575,6 +583,37 @@ _doctor_check_password_store() {
 	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
 		_info \
 			"  → overridden by CLAUDE_PASSWORD_STORE=${CLAUDE_PASSWORD_STORE}"
+	fi
+}
+
+# Report free space on the partition holding the Claude config dir.
+# Arguments: $1 = config directory to check.
+#
+# Skips when df is unavailable or yields a non-numeric value, leaving
+# an _info line so the summary never claims a pass over an unrun
+# check: better a visible skip than a green PASS reporting space we
+# could not read.
+_doctor_check_disk_space() {
+	local config_dir="$1"
+	local avail
+	avail=$(df -BM --output=avail "$config_dir" 2>/dev/null \
+		| tail -1 | tr -d ' M') || true
+	if [[ ! $avail =~ ^[0-9]+$ ]]; then
+		_info 'Disk space: unable to read (df)'
+		return 0
+	fi
+	# Force base 10: a leading zero ("0099") would otherwise make
+	# (( )) parse the value as octal and error out, falling through
+	# to the PASS branch.
+	avail=$((10#$avail))
+	if ((avail < 100)); then
+		_fail "Disk space: ${avail}MB free on config partition"
+		_info 'Fix: Free up disk space'
+	elif ((avail < 500)); then
+		_warn "Disk space: ${avail}MB free" \
+			"on config partition (low)"
+	else
+		_pass "Disk space: ${avail}MB free"
 	fi
 }
 
@@ -740,6 +779,74 @@ run_doctor() {
 		_warn 'Chrome sandbox not found (expected for AppImage)'
 	fi
 
+	# -- User-namespace sandbox (Ubuntu 24.04+ AppArmor) --
+	# Ubuntu 24.04+ sets apparmor_restrict_unprivileged_userns=1, which
+	# blocks the user namespaces Chromium's sandbox needs and crashes the
+	# app on launch (credentials.cc FATAL, exit 133). A scoped AppArmor
+	# profile permits them for Claude only. Only report when the
+	# restriction is actually in force — on other distros the knob is
+	# absent and this check stays silent.
+	local _userns_path='/proc/sys/kernel/apparmor_restrict_unprivileged_userns'
+	local _userns_val=''
+	[[ -r $_userns_path ]] && _userns_val=$(<"$_userns_path")
+	# Gate on the deb's installed Electron, not $electron_path (the
+	# invoking build's binary): the profile pins this exact path, so only
+	# a deb install is confined by it. AppImage always runs --no-sandbox
+	# and Nix binaries live in the store — neither can hit the crash.
+	local _deb_electron='/usr/lib/claude-desktop'
+	_deb_electron+='/node_modules/electron/dist/electron'
+	if [[ $_userns_val == 1 && -e $_deb_electron ]]; then
+		# Profile name must match deb.sh's /etc/apparmor.d/$package_name
+		# (PACKAGE_NAME in build.sh).
+		local _aa_profile='/etc/apparmor.d/claude-desktop'
+		local _aa_loaded='/sys/kernel/security/apparmor/profiles'
+		# securityfs marks this file world-readable (0444), but the kernel
+		# still denies the actual read without CAP_MAC_ADMIN — so a -r test
+		# passes for non-root yet the read returns nothing. Attempt the read
+		# and judge by whether we actually got data, not by the mode bits.
+		local _loaded_set=''
+		_loaded_set=$(cat "$_aa_loaded" 2>/dev/null)
+		if [[ -n $_loaded_set ]]; then
+			# Authoritative: we actually read the kernel's loaded profile
+			# set (needs root), so report the real load state — not
+			# mere presence on disk.
+			if printf '%s\n' "$_loaded_set" | grep -q '^claude-desktop '; then
+				_pass 'User namespaces: restricted, AppArmor profile loaded'
+			else
+				_warn 'User namespaces: restricted by AppArmor,' \
+					'Claude profile not loaded'
+				if [[ -e $_aa_profile ]]; then
+					_info '  Profile is on disk but not loaded. Load it:'
+					_info "  sudo apparmor_parser -r $_aa_profile"
+				else
+					_info '  No profile found. See docs/troubleshooting.md'
+					_info '  "Claude Desktop crashes immediately on launch".'
+				fi
+			fi
+		elif [[ -e $_aa_profile ]]; then
+			# The loaded set was unreadable: non-root (the kernel needs
+			# CAP_MAC_ADMIN despite the 0444 mode), or securityfs is
+			# unmounted (common in containers). Report presence on disk
+			# only — never a definitive PASS.
+			if (( EUID == 0 )); then
+				_info 'User namespaces: AppArmor profile present on disk' \
+					'(securityfs unavailable; cannot confirm it is loaded)'
+			else
+				_info 'User namespaces: AppArmor profile present on disk' \
+					'(re-run with sudo to confirm it is loaded)'
+			fi
+		else
+			_warn 'User namespaces: restricted by AppArmor,' \
+				'no Claude profile found'
+			_info '  Unprivileged user namespaces are blocked, which'
+			_info '  crashes the app on launch in X11 sessions'
+			_info '  (credentials.cc FATAL). Wayland sessions run with'
+			_info '  --no-sandbox and are unaffected.'
+			_info '  See docs/troubleshooting.md "Claude Desktop crashes'
+			_info '  immediately on launch" for the profile to install.'
+		fi
+	fi
+
 	# -- SingletonLock --
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 	local lock_file="$config_dir/SingletonLock"
@@ -828,20 +935,7 @@ print(len(servers))
 	fi
 
 	# -- Disk space --
-	local config_disk_avail
-	config_disk_avail=$(df -BM --output=avail "$config_dir" 2>/dev/null \
-		| tail -1 | tr -d ' M') || true
-	if [[ -n $config_disk_avail ]]; then
-		if ((config_disk_avail < 100)); then
-			_fail "Disk space: ${config_disk_avail}MB free on config partition"
-			_info 'Fix: Free up disk space'
-		elif ((config_disk_avail < 500)); then
-			_warn "Disk space: ${config_disk_avail}MB free" \
-				"on config partition (low)"
-		else
-			_pass "Disk space: ${config_disk_avail}MB free"
-		fi
-	fi
+	_doctor_check_disk_space "$config_dir"
 
 	# -- Cowork Mode --
 	echo
